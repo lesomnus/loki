@@ -125,14 +125,14 @@ func TestDecodeNestedRecordYieldsFlatStream(t *testing.T) {
 	require.Equal(t, "a", got.Entries[0].Line)
 	require.Equal(t, push.LabelsAdapter{
 		{Name: "trace_id", Value: "1"},
-		{Name: "host", Value: "host-1"},
 		{Name: "scope", Value: "lib"},
+		{Name: "host", Value: "host-1"},
 	}, got.Entries[0].StructuredMetadata)
 
 	require.Equal(t, "b", got.Entries[1].Line)
 	require.Equal(t, push.LabelsAdapter{
-		{Name: "host", Value: "host-1"},
 		{Name: "scope", Value: "lib"},
+		{Name: "host", Value: "host-1"},
 	}, got.Entries[1].StructuredMetadata)
 }
 

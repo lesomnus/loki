@@ -9,92 +9,56 @@ import (
 	"github.com/grafana/loki/pkg/push"
 )
 
-func entry(ns int64, line string, md ...push.LabelAdapter) push.Entry {
-	return push.Entry{
-		Timestamp:          time.Unix(0, ns),
-		Line:               line,
-		StructuredMetadata: md,
-	}
-}
-
-// TestEncodingsAreMutuallyUndecodable pins the property the field numbering of
-// InternalStreamAdapter exists to provide: a record written in either encoding fails to
-// decode as the other, so a consumer can attempt one and fall back on error rather than
-// decoding to a stream with no entries and silently dropping every line.
-//
-// Giving Stream a varint field 2, or InternalStreamAdapter a length delimited one, would
-// quietly remove the property, which is why it is asserted here rather than assumed.
 func TestEncodingsAreMutuallyUndecodable(t *testing.T) {
 	oneEntry := []push.Entry{entry(1, "x")}
 	oneGroup := []ResourceLogs{{ScopeLogs: []ScopeLogs{{Entries: oneEntry}}}}
 
-	marshalFlat := func(t *testing.T, s Stream) []byte {
-		t.Helper()
-		data, err := s.Marshal()
-		require.NoError(t, err)
-		return data
-	}
-	marshalNested := func(t *testing.T, s InternalStreamAdapter) []byte {
-		t.Helper()
-		data, err := s.Marshal()
-		require.NoError(t, err)
-		return data
-	}
-
 	tests := []struct {
 		name          string
-		data          func(*testing.T) []byte
+		record        interface{ Marshal() ([]byte, error) }
 		decodesFlat   bool
 		decodesNested bool
 	}{
 		{
-			name: "flat with entries and a hash",
-			data: func(t *testing.T) []byte {
-				return marshalFlat(t, Stream{Labels: `{a="b"}`, Hash: 7, Entries: oneEntry})
-			},
+			name:        "flat with entries and a hash",
+			record:      &Stream{Labels: `{a="b"}`, Hash: 7, Entries: oneEntry},
 			decodesFlat: true,
 		},
 		{
 			name:        "flat with entries and a zero hash",
-			data:        func(t *testing.T) []byte { return marshalFlat(t, Stream{Labels: `{a="b"}`, Entries: oneEntry}) },
+			record:      &Stream{Labels: `{a="b"}`, Entries: oneEntry},
 			decodesFlat: true,
 		},
 		{
 			name:        "flat with a hash and no entries",
-			data:        func(t *testing.T) []byte { return marshalFlat(t, Stream{Labels: `{a="b"}`, Hash: 7}) },
+			record:      &Stream{Labels: `{a="b"}`, Hash: 7},
 			decodesFlat: true,
 		},
 		{
 			name:        "flat with a single zero valued entry",
-			data:        func(t *testing.T) []byte { return marshalFlat(t, Stream{Labels: `{a="b"}`, Entries: []push.Entry{{}}}) },
+			record:      &Stream{Labels: `{a="b"}`, Entries: []push.Entry{{}}},
 			decodesFlat: true,
 		},
 		{
-			name: "nested with groups and a hash",
-			data: func(t *testing.T) []byte {
-				return marshalNested(t, InternalStreamAdapter{Labels: `{a="b"}`, Hash: 7, ResourceLogs: oneGroup})
-			},
+			name:          "nested with groups and a hash",
+			record:        &InternalStreamAdapter{Labels: `{a="b"}`, Hash: 7, ResourceLogs: oneGroup},
 			decodesNested: true,
 		},
 		{
-			name: "nested with groups and a zero hash",
-			data: func(t *testing.T) []byte {
-				return marshalNested(t, InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: oneGroup})
-			},
+			name:          "nested with groups and a zero hash",
+			record:        &InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: oneGroup},
 			decodesNested: true,
 		},
 		{
-			name: "nested with a single empty group",
-			data: func(t *testing.T) []byte {
-				return marshalNested(t, InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{}}})
-			},
+			name:          "nested with a single empty group",
+			record:        &InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{}}},
 			decodesNested: true,
 		},
 		{
 			// The only shape both accept, because neither carries a field the other
 			// disagrees about. Asserted to decode the same either way below.
 			name:          "labels alone",
-			data:          func(t *testing.T) []byte { return marshalFlat(t, Stream{Labels: `{a="b"}`}) },
+			record:        &Stream{Labels: `{a="b"}`},
 			decodesFlat:   true,
 			decodesNested: true,
 		},
@@ -102,7 +66,8 @@ func TestEncodingsAreMutuallyUndecodable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data := tt.data(t)
+			data, err := tt.record.Marshal()
+			require.NoError(t, err)
 
 			var flat Stream
 			flatErr := flat.Unmarshal(data)
@@ -134,8 +99,8 @@ func TestFromStreamRoundTripsThroughToStream(t *testing.T) {
 		{
 			name: "entries with structured metadata",
 			stream: Stream{Labels: `{a="b"}`, Hash: 7, Entries: []push.Entry{
-				entry(1, "x", push.LabelAdapter{Name: "trace_id", Value: "1"}),
-				entry(2, "y", push.LabelAdapter{Name: "trace_id", Value: "2"}),
+				entry(1, "x", attrs("trace_id", "1")...),
+				entry(2, "y", attrs("trace_id", "2")...),
 			}},
 		},
 	}
@@ -152,127 +117,196 @@ func TestFromStreamRoundTripsThroughToStream(t *testing.T) {
 	}
 }
 
-// TestToStreamLeavesEntriesNilWhenEmpty keeps a decoded record indistinguishable from the
-// flat form, which unmarshals to a nil slice rather than an empty one when it carries no
-// entries.
-func TestToStreamLeavesEntriesNilWhenEmpty(t *testing.T) {
-	for _, s := range []InternalStreamAdapter{
-		{Labels: `{a="b"}`},
-		{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{}}},
-		{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{ScopeLogs: []ScopeLogs{{}}}}},
-	} {
-		var got Stream
-		s.ToStream(&got)
-		require.Nil(t, got.Entries)
-	}
-}
-
-// TestToStreamOverwritesAReusedStream covers the reuse the decoder does between records:
-// nothing of the stream out held before may survive, least of all entries, which an
-// entry-less record would otherwise inherit whole.
-func TestToStreamOverwritesAReusedStream(t *testing.T) {
-	out := Stream{Labels: `{a="b"}`, Hash: 7, Entries: []push.Entry{entry(1, "x"), entry(2, "y")}}
-
-	empty := InternalStreamAdapter{Labels: `{c="d"}`, ResourceLogs: []ResourceLogs{{ScopeLogs: []ScopeLogs{{}}}}}
-	empty.ToStream(&out)
-
-	require.Equal(t, `{c="d"}`, out.Labels)
-	require.Zero(t, out.Hash)
-	require.Empty(t, out.Entries)
-}
-
-// TestToStreamResolvesEffectiveMetadata pins the expansion against what the OTLP parse site
-// produces when it flattens attributes onto entries itself: the entry's own pairs, then the
-// resource's, then the scope's, neither sorted nor deduplicated. Anything else and a nested
-// record would store different bytes than its flat equivalent.
-func TestToStreamResolvesEffectiveMetadata(t *testing.T) {
-	nested := InternalStreamAdapter{
-		Labels: `{a="b"}`,
-		Hash:   7,
-		ResourceLogs: []ResourceLogs{{
-			Attrs: []push.LabelAdapter{{Name: "host", Value: "host-1"}, {Name: "shared", Value: "resource"}},
-			ScopeLogs: []ScopeLogs{{
-				Attrs: []push.LabelAdapter{{Name: "scope", Value: "lib"}, {Name: "shared", Value: "scope"}},
-				Entries: []push.Entry{
-					entry(1, "x", push.LabelAdapter{Name: "shared", Value: "entry"}),
-					entry(2, "y"),
+func TestToStream(t *testing.T) {
+	tests := []struct {
+		name   string
+		nested InternalStreamAdapter
+		want   Stream
+	}{
+		{
+			name:   "labels alone",
+			nested: InternalStreamAdapter{Labels: `{a="b"}`},
+			want:   Stream{Labels: `{a="b"}`},
+		},
+		{
+			name:   "an empty group",
+			nested: InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{}}},
+			want:   Stream{Labels: `{a="b"}`},
+		},
+		{
+			name:   "an empty scope",
+			nested: InternalStreamAdapter{Labels: `{a="b"}`, ResourceLogs: []ResourceLogs{{ScopeLogs: []ScopeLogs{{}}}}},
+			want:   Stream{Labels: `{a="b"}`},
+		},
+		{
+			name: "entries with nothing lifted off them",
+			nested: InternalStreamAdapter{
+				Labels: `{a="b"}`,
+				Hash:   7,
+				ResourceLogs: []ResourceLogs{
+					resource(
+						attrs(),
+						scope(
+							attrs(),
+							entry(1, "x", attrs("trace_id", "1")...),
+							entry(2, "y"),
+						),
+					),
 				},
+			},
+			want: Stream{Labels: `{a="b"}`, Hash: 7, Entries: []push.Entry{
+				entry(1, "x", attrs("trace_id", "1")...),
+				entry(2, "y"),
 			}},
-		}},
-	}
-
-	var got Stream
-	nested.ToStream(&got)
-
-	require.Equal(t, `{a="b"}`, got.Labels)
-	require.Equal(t, uint64(7), got.Hash)
-	require.Len(t, got.Entries, 2)
-
-	require.Equal(t, push.LabelsAdapter{
-		{Name: "shared", Value: "entry"},
-		{Name: "host", Value: "host-1"},
-		{Name: "shared", Value: "resource"},
-		{Name: "scope", Value: "lib"},
-		{Name: "shared", Value: "scope"},
-	}, got.Entries[0].StructuredMetadata)
-
-	require.Equal(t, push.LabelsAdapter{
-		{Name: "host", Value: "host-1"},
-		{Name: "shared", Value: "resource"},
-		{Name: "scope", Value: "lib"},
-		{Name: "shared", Value: "scope"},
-	}, got.Entries[1].StructuredMetadata)
-}
-
-// TestToStreamKeepsEntriesUnderTheirOwnGroup guards the association that containment
-// carries: an entry must not inherit the attributes of a resource it does not sit under.
-func TestToStreamKeepsEntriesUnderTheirOwnGroup(t *testing.T) {
-	nested := InternalStreamAdapter{
-		Labels: `{a="b"}`,
-		ResourceLogs: []ResourceLogs{
-			{
-				Attrs:     []push.LabelAdapter{{Name: "host", Value: "host-1"}},
-				ScopeLogs: []ScopeLogs{{Entries: []push.Entry{entry(1, "one")}}},
+		},
+		{
+			name: "resource and scope attributes resolved onto each entry",
+			nested: InternalStreamAdapter{
+				Labels: `{a="b"}`,
+				Hash:   7,
+				ResourceLogs: []ResourceLogs{
+					resource(
+						attrs("host", "host-1", "shared", "resource"),
+						scope(
+							attrs("scope", "lib", "shared", "scope"),
+							entry(1, "x", attrs("shared", "entry")...),
+							entry(2, "y"),
+						),
+					),
+				},
 			},
-			{
-				Attrs:     []push.LabelAdapter{{Name: "host", Value: "host-2"}},
-				ScopeLogs: []ScopeLogs{{Entries: []push.Entry{entry(2, "two")}}},
+			want: Stream{Labels: `{a="b"}`, Hash: 7, Entries: []push.Entry{
+				entry(1, "x", attrs("shared", "entry", "scope", "lib", "host", "host-1")...),
+				entry(2, "y", attrs("scope", "lib", "shared", "scope", "host", "host-1")...),
+			}},
+		},
+		{
+			name: "entries under separate groups",
+			nested: InternalStreamAdapter{
+				Labels: `{a="b"}`,
+				ResourceLogs: []ResourceLogs{
+					resource(attrs("host", "host-1"), scope(attrs(), entry(1, "one"))),
+					resource(attrs("host", "host-2"), scope(attrs(), entry(2, "two"))),
+				},
 			},
+			want: Stream{Labels: `{a="b"}`, Entries: []push.Entry{
+				entry(1, "one", attrs("host", "host-1")...),
+				entry(2, "two", attrs("host", "host-2")...),
+			}},
+		},
+		{
+			name: "attributes priority",
+			nested: InternalStreamAdapter{
+				Labels: `{a="b"}`,
+				ResourceLogs: []ResourceLogs{
+					resource(
+						attrs("host", "resource-1"),
+						scope(
+							attrs("host", "scope-11"),
+							entry(111, "e111", attrs("host", "entry-111")...),
+							entry(112, "e112"),
+						),
+						scope(
+							attrs(),
+							entry(121, "e121", attrs("host", "entry-121")...),
+							entry(122, "e122"),
+						),
+					),
+					resource(
+						attrs(),
+						scope(
+							attrs("host", "scope-21"),
+							entry(211, "e211", attrs("host", "entry-211")...),
+							entry(212, "e212"),
+						),
+						scope(
+							attrs(),
+							entry(221, "e221", attrs("host", "entry-221")...),
+							entry(222, "e222"),
+						),
+					),
+					resource(
+						attrs(),
+						scope(
+							attrs(),
+							entry(311, "e311", attrs("host", "entry-311")...),
+							entry(312, "e312"),
+						),
+					),
+				},
+			},
+			want: Stream{Labels: `{a="b"}`, Entries: []push.Entry{
+				// resource 1
+				// -> scope 11
+				entry(111, "e111", attrs("host", "entry-111")...),
+				entry(112, "e112", attrs("host", "scope-11")...),
+				// -> scope 12
+				entry(121, "e121", attrs("host", "entry-121")...),
+				entry(122, "e122", attrs("host", "resource-1")...),
+
+				// resource 2
+				// -> scope 21
+				entry(211, "e211", attrs("host", "entry-211")...),
+				entry(212, "e212", attrs("host", "scope-21")...),
+				// -> scope 22
+				entry(221, "e221", attrs("host", "entry-221")...),
+				entry(222, "e222"),
+
+				// resource 3
+				entry(311, "e311", attrs("host", "entry-311")...),
+				entry(312, "e312"),
+			}},
 		},
 	}
 
 	var got Stream
-	nested.ToStream(&got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before, err := tt.nested.Marshal()
+			require.NoError(t, err)
 
-	require.Len(t, got.Entries, 2)
-	require.Equal(t, "one", got.Entries[0].Line)
-	require.Equal(t, push.LabelsAdapter{{Name: "host", Value: "host-1"}}, got.Entries[0].StructuredMetadata)
-	require.Equal(t, "two", got.Entries[1].Line)
-	require.Equal(t, push.LabelsAdapter{{Name: "host", Value: "host-2"}}, got.Entries[1].StructuredMetadata)
+			tt.nested.ToStream(&got)
+			require.Equal(t, tt.want, got)
+
+			after, err := tt.nested.Marshal()
+			require.NoError(t, err)
+			require.Equal(t, before, after, "flattening a record must not modify it")
+		})
+	}
 }
 
-// TestToStreamDoesNotWriteThroughSharedAttrs guards against expanding into a shared slice.
-// Appending an entry's own metadata onto res.Attrs saves an allocation and is the obvious
-// shortcut, but a resource's attributes belong to every entry beneath it, so taking it would
-// corrupt the entry's siblings.
-func TestToStreamDoesNotWriteThroughSharedAttrs(t *testing.T) {
-	resAttrs := make([]push.LabelAdapter, 1, 8) // spare capacity is what makes a stray append silent
-	resAttrs[0] = push.LabelAdapter{Name: "host", Value: "host-1"}
+func entry(ns int64, line string, md ...push.LabelAdapter) push.Entry {
+	return push.Entry{
+		Timestamp:          time.Unix(0, ns),
+		Line:               line,
+		StructuredMetadata: md,
+	}
+}
 
-	nested := InternalStreamAdapter{
-		Labels: `{a="b"}`,
-		ResourceLogs: []ResourceLogs{{
-			Attrs: resAttrs,
-			ScopeLogs: []ScopeLogs{{
-				Attrs:   []push.LabelAdapter{{Name: "scope", Value: "lib"}},
-				Entries: []push.Entry{entry(1, "x"), entry(2, "y")},
-			}},
-		}},
+func resource(attrs []push.LabelAdapter, scopes ...ScopeLogs) ResourceLogs {
+	return ResourceLogs{
+		Attrs:     attrs,
+		ScopeLogs: scopes,
+	}
+}
+
+func attrs(keyValues ...string) []push.LabelAdapter {
+	if len(keyValues)%2 != 0 {
+		panic("odd number of keyValues")
 	}
 
-	var got Stream
-	nested.ToStream(&got)
+	res := make([]push.LabelAdapter, 0, len(keyValues)/2)
 
-	require.Equal(t, []push.LabelAdapter{{Name: "host", Value: "host-1"}}, nested.ResourceLogs[0].Attrs)
-	require.Equal(t, []push.LabelAdapter{{Name: "scope", Value: "lib"}}, nested.ResourceLogs[0].ScopeLogs[0].Attrs)
+	for i := 0; i < len(keyValues); i += 2 {
+		res = append(res, push.LabelAdapter{Name: keyValues[i], Value: keyValues[i+1]})
+	}
+
+	return res
+}
+
+func scope(attrs []push.LabelAdapter, entries ...push.Entry) ScopeLogs {
+	return ScopeLogs{
+		Attrs:   attrs,
+		Entries: entries,
+	}
 }
